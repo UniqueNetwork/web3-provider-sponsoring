@@ -40,56 +40,107 @@ class TransactionHelper extends Transaction {
 	}
 }
 
+export interface ProviderConfig {
+	/**
+	 * Should transaction sends be handled by this provider instead of inner provider
+	 *
+	 * In case of metamask, this allows to bypass free balance check for uniquenetwork sponsoring
+	 *
+	 * Disabled by default
+	 */
+	hookSends: boolean;
+	/**
+	 * Should this provider implement `eth_signTransaction` method via `eth_sign`
+	 *
+	 * For metamask, as it doesn't support `eth_signTransaction`
+	 *
+	 * Enabled by default for metamask provider, disabled in other case
+	 */
+	polyfillSign: boolean;
+}
+
 export default class SponsoringProvider {
 	#real: any;
+	#config: ProviderConfig;
 
 	/**
 	 * @param real provider, to which all requests would be
 	 * redirected after interception
 	 */
-	constructor(real: any) {
+	constructor(real: any, config: Partial<ProviderConfig> = {}) {
 		this.#real = real;
 		if ("isMetaMask" in real) {
 			(this as any).isMetaMask = real.isMetaMask;
 		}
 		if ("_metamask" in real) {
 			(this as any)._metamask = real._metamask;
+
+			if (!('polyfillSign' in config)) {
+				config.polyfillSign = true;
+			}
+		} else if (!('polyfillSign' in config)) {
+			config.polyfillSign = false;
 		}
+
+		if (!('hookSends' in config)) {
+			config.hookSends = false;
+		}
+		this.#config = config as ProviderConfig;
+	}
+	async #signTransaction(args: any): Promise<string> {
+		const txParams = args.params[0];
+		if (!txParams.nonce) {
+			txParams.nonce = await this.#real.request({
+				method: "eth_getTransactionCount",
+				params: [txParams.from, "latest"]
+			});
+		}
+		if (!txParams.gasPrice) {
+			txParams.gasPrice = await this.#real.request({
+				method: "eth_gasPrice"
+			});
+		}
+		if (!txParams.gas) {
+			txParams.gas = await this.#real.request({
+				method: "eth_estimateGas",
+				params: {
+					from: txParams.from,
+					to: txParams.to,
+					value: txParams.value,
+					gasPrice: txParams.gasPrice,
+					data: txParams.data,
+				},
+			});
+		}
+		txParams.gasLimit = txParams.gas;
+		delete txParams.gas;
+
+		const chainIdHex = await this.#real.request({
+			method: "eth_chainId",
+			params: []
+		});
+		const chainId = parseInt(chainIdHex.slice(2), 16);
+
+		const txUnsigned = new TransactionHelper(txParams, {
+			common: Common.custom({ chainId })
+		});
+
+		const tx = await txUnsigned.signViaProvider(this, txParams.from);
+		const rawTx = "0x" + tx.serialize().toString("hex");
+		return rawTx;
 	}
 	async request(args: any) {
-		if (args.method === "eth_sendTransaction") {
-			const txParams = args.params[0];
-			if (!txParams.nonce) {
-				txParams.nonce = await this.#real.request({
-					method: "eth_getTransactionCount",
-					params: [txParams.from, "latest"]
-				});
-			}
-			if (!txParams.gasPrice) {
-				txParams.gasPrice = await this.#real.request({
-					method: "eth_gasPrice"
-				});
-			}
-			txParams.gasLimit = txParams.gas;
-			delete txParams.gas;
-
-			const chainIdHex = await this.#real.request({
-				method: "eth_chainId",
-				params: []
-			});
-			const chainId = parseInt(chainIdHex.slice(2), 16);
-
-			const txUnsigned = new TransactionHelper(txParams, {
-				common: Common.custom({ chainId })
-			});
-
-			const tx = await txUnsigned.signViaProvider(this, txParams.from);
-			const rawTx = "0x" + tx.serialize().toString("hex");
+		if (args.method === "eth_sendTransaction" && this.#config.hookSends) {
+			const rawTx = await this.#signTransaction(args);
 
 			return this.#real.request({
 				method: "eth_sendRawTransaction",
 				params: [rawTx]
 			});
+		} else if (args.method === "eth_signTransaction" && this.#config.polyfillSign) {
+			const rawTx = await this.#signTransaction(args);
+
+			return rawTx;
 		} else {
 			return this.#real.request(args);
 		}
